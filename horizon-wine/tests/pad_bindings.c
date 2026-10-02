@@ -122,9 +122,36 @@ static void test_defaults( void )
     assert( out.mouse == (PAD_MOUSE_BIT(PAD_MOUSE_LEFT) | PAD_MOUSE_BIT(PAD_MOUSE_MIDDLE)) );
 }
 
+/* COMBOS=hold, the default: the first control sends its own all along. */
+static void test_hold( void )
+{
+    int tap = 1;
+
+    fresh();
+    assert( !bindings.modifier_tap );
+    line( "ZR", "mouse:left" );
+    line( "ZR+A", "0x51" );
+    step( BIT(ZR), 0 );
+    assert( out.mouse == PAD_MOUSE_BIT(PAD_MOUSE_LEFT) );
+    /* Q while the click goes on, and no click of A's own. */
+    step( BIT(ZR) | BIT(A), MS );
+    assert( out.mouse == PAD_MOUSE_BIT(PAD_MOUSE_LEFT) && key( 0x51 ) );
+    step( BIT(ZR), 2 * MS );
+    assert( out.mouse == PAD_MOUSE_BIT(PAD_MOUSE_LEFT) && !key( 0x51 ) );
+    /* Let go: nothing more, no tap. */
+    step( 0, 3 * MS );
+    assert( no_keys() );
+
+    assert( pad_combos_mode_parse( "TAP", &tap ) && tap == 1 );
+    assert( pad_combos_mode_parse( "hold", &tap ) && tap == 0 );
+    assert( !pad_combos_mode_parse( "holding", &tap ) );
+}
+
+/* COMBOS=tap. */
 static void test_combinations( void )
 {
     fresh();
+    bindings.modifier_tap = 1;
     line( "L+A", "0x54" );
     line( "L+X", "shift+0x31" );
 
@@ -245,6 +272,7 @@ int main( void )
 {
     test_lines();
     test_defaults();
+    test_hold();
     test_combinations();
     test_wheel();
     test_room();

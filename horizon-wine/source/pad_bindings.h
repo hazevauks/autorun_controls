@@ -9,10 +9,12 @@
  * modifiers (shift+0x31), mouse:left, right, middle, x1 or x2, wheel:up or
  * down, or none.
  *
- * A combination wants its first control held before the second is pressed. A
- * control that starts any combination sends its own action only when it is
- * let go without one having been used meanwhile, as a tap; one that starts
- * none sends it for as long as it is held, as it always has.
+ * A combination wants its first control held before the second is pressed.
+ * COMBOS=hold (the default) has a control that starts combinations send its
+ * own action for as long as it is held, combinations or not: ZR can click and
+ * hold the click while ZR+A casts. COMBOS=tap has it wait instead and send
+ * its own action only when let go without a combination used meanwhile, as a
+ * tap, for a shoulder that is only ever a shift.
  *
  * No libnx here: the runtime (runtime.c) turns the controller into the held
  * controls each poll, the launcher reads and writes the same lines, and the
@@ -86,7 +88,17 @@ struct pad_bindings
     struct pad_action single[WINE_NX_KEY_COUNT];
     struct pad_combo combo[PAD_BIND_COMBO_MAX];
     int combos;
+    int modifier_tap;          /* COMBOS=tap: a control starting combinations waits to be tapped */
 };
+
+/* The COMBOS line's value. Returns 0 when it is neither word. */
+static inline int pad_combos_mode_parse( const char *text, int *tap )
+{
+    if (!strcasecmp( text, "hold" )) *tap = 0;
+    else if (!strcasecmp( text, "tap" )) *tap = 1;
+    else return 0;
+    return 1;
+}
 
 /* What a step leaves held, and what was pressed and let go within it. Keys are
  * a bit for each virtual-key code. */
@@ -406,7 +418,7 @@ static inline void pad_bind_step( struct pad_bind_state *s, const struct pad_bin
                 s->emitting[i] = (signed char)best;
                 s->used |= 1u << b->combo[best].mod;
             }
-            else s->emitting[i] = (mods & (1u << i)) ? PAD_EMIT_PENDING : PAD_EMIT_SINGLE;
+            else s->emitting[i] = b->modifier_tap && (mods & (1u << i)) ? PAD_EMIT_PENDING : PAD_EMIT_SINGLE;
 
             a = pad_bind_emitting( b, s, i );
             if (a.type == PAD_ACTION_WHEEL)

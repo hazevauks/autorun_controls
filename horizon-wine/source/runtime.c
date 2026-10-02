@@ -1709,7 +1709,7 @@ static void read_key_map( const char *path )
     if (!file) return;
     while (fgets( line, sizeof(line), file ))
     {
-        char *equals, *name = line, *value;
+        char *equals, *name = line, *value, *end;
         unsigned int i;
         int c;
 
@@ -1728,6 +1728,7 @@ static void read_key_map( const char *path )
         value = equals + 1;
         while (*name == ' ') name++;
         while (*value == ' ') value++;
+        for (end = equals; end > name && end[-1] == ' '; end--) end[-1] = 0;
         /* The three that point say what they do rather than which key they
          * are: LSTICK=mouse, RSTICK=keys. */
         for (i = 0; i < WINE_NX_DEVICE_COUNT; i++)
@@ -1744,12 +1745,17 @@ static void read_key_map( const char *path )
                 break;
             }
         if (i < WINE_NX_DEVICE_COUNT) continue;
+        /* COMBOS=hold or tap: what a control starting combinations does alone. */
+        if (!strcasecmp( name, "COMBOS" ))
+        {
+            if (pad_combos_mode_parse( value, &wine_nx_bindings.modifier_tap )) changed++;
+            else log_line( "[NXINPUT] %s: COMBOS is hold or tap, not '%s'", path, value );
+            continue;
+        }
         {
             struct pad_action action;
             int mod, source;
-            char *end = name + strlen( name );
 
-            while (end > name && end[-1] == ' ') *--end = 0;
             if (!pad_trigger_parse( name, wine_nx_pad_key_names, WINE_NX_KEY_COUNT, &mod, &source ))
                 log_line( "[NXINPUT] %s: unknown control '%s'", path, name );
             else if (!pad_action_parse( value, &action ))

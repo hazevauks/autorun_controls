@@ -3408,10 +3408,24 @@ static int combo_reserved( int mod, int source )
  * first row adds one; A changes what one sends, and Y takes it away. A
  * program's screen shows the shared ones too, and taking one of those away
  * there turns it off for the program alone. Returns whether keys changed. */
+/* COMBOS=tap from the program's file or the shared one; hold without either. */
+static int combos_tap( const struct launcher_kv *keys, const struct launcher_kv *under )
+{
+    char value[16];
+    int tap = 0;
+
+    if (launcher_kv_get( keys, "COMBOS", value, sizeof(value) ) && pad_combos_mode_parse( value, &tap )) return tap;
+    if (under && launcher_kv_get( under, "COMBOS", value, sizeof(value) ) && pad_combos_mode_parse( value, &tap ))
+        return tap;
+    return 0;
+}
+
 static int combos_screen( struct launcher *l, struct launcher_kv *keys, const struct launcher_kv *under )
 {
+    /* Adding one, how the first control behaves, then the combinations. */
+    enum { ROW_ADD, ROW_MODE, ROW_FIRST };
     static struct combo_line lines[COMBO_LINES_MAX];
-    static struct ui_row rows[COMBO_LINES_MAX + 1];
+    static struct ui_row rows[COMBO_LINES_MAX + ROW_FIRST];
     const char *labels[WINE_NX_CONTROL_COUNT];
     struct ui_list list = {0};
     int changed = 0, count, i;
@@ -3426,13 +3440,20 @@ static int combos_screen( struct launcher *l, struct launcher_kv *keys, const st
         count = read_combo_lines( keys, 1, lines, 0 );
         if (under) count = read_combo_lines( under, 0, lines, count );
         memset( rows, 0, sizeof(rows) );
-        snprintf( rows[0].label, sizeof(rows[0].label), "Add a combination" );
-        rows[0].kind = UI_ROW_ACTION;
-        rows[0].help = "Hold one control, press another, and send a key, a mouse button or the wheel. "
-                       "The control held first then sends its own key only when tapped alone.";
+        snprintf( rows[ROW_ADD].label, sizeof(rows[0].label), "Add a combination" );
+        rows[ROW_ADD].kind = UI_ROW_ACTION;
+        rows[ROW_ADD].help = "Hold one control, press another, and send a key, a mouse button or the wheel.";
+        snprintf( rows[ROW_MODE].label, sizeof(rows[0].label), "The control held first" );
+        snprintf( rows[ROW_MODE].value, sizeof(rows[0].value), "%s",
+                  combos_tap( keys, under ) ? "Sends its own when tapped" : "Sends its own while held" );
+        rows[ROW_MODE].kind = UI_ROW_VALUE;
+        rows[ROW_MODE].adjustable = 1;
+        rows[ROW_MODE].help = "While held, ZR can keep clicking while ZR + A casts. When tapped, it sends "
+                              "nothing until let go, and then only if no combination was used: for a "
+                              "shoulder that is only a shift.";
         for (i = 0; i < count; i++)
         {
-            struct ui_row *row = &rows[i + 1];
+            struct ui_row *row = &rows[i + ROW_FIRST];
 
             snprintf( row->label, sizeof(row->label), "%s + %s", wine_nx_controls[lines[i].mod].label,
                       wine_nx_controls[lines[i].source].label );
@@ -3443,11 +3464,18 @@ static int combos_screen( struct launcher *l, struct launcher_kv *keys, const st
             row->help = lines[i].own ? "A changes what it sends; Y takes it away."
                                      : "From the controls every game uses. Y turns it off for this game.";
         }
-        if (list.selection > count) list.selection = count;
-        action = ui_list_run( &l->ui, &list, "Combinations", "Controls", rows, count + 1, 1 );
+        if (list.selection >= count + ROW_FIRST) list.selection = count + ROW_FIRST - 1;
+        action = ui_list_run( &l->ui, &list, "Combinations", "Controls", rows, count + ROW_FIRST, 1 );
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) break;
 
-        if (list.selection == 0)
+        if (list.selection == ROW_MODE)
+        {
+            if (action == UI_ACTION_RESET) launcher_kv_set( keys, "COMBOS", NULL );
+            else launcher_kv_set( keys, "COMBOS", combos_tap( keys, under ) ? "hold" : "tap" );
+            changed = 1;
+            continue;
+        }
+        if (list.selection == ROW_ADD)
         {
             int mod, source;
 
@@ -3484,7 +3512,7 @@ static int combos_screen( struct launcher *l, struct launcher_kv *keys, const st
             continue;
         }
 
-        i = list.selection - 1;
+        i = list.selection - ROW_FIRST;
         snprintf( trigger, sizeof(trigger), "%s+%s", wine_nx_controls[lines[i].mod].name,
                   wine_nx_controls[lines[i].source].name );
         if (action == UI_ACTION_CHOOSE)
