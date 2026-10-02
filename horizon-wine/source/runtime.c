@@ -34,6 +34,7 @@
 #include "fex_options.h"
 #include "config_json.h"
 #include "pointer_cursor.h"
+#include "pad_bindings.h"
 #include "compositor.h"
 #include "osk.h"
 #include "std_stream_lines.h"
@@ -548,6 +549,15 @@ static int wine_nx_pointer_placed;
  * Half a centimetre of a 1280-pixel screen, so that a tap is not a direction. */
 #define WINE_NX_TOUCH_STEP 40
 static int wine_nx_touch_held, wine_nx_touch_x, wine_nx_touch_y, wine_nx_touch_dx, wine_nx_touch_dy;
+/* What the controls send (pad_bindings.h), read from keys.txt before the
+ * program starts, and where the polls are in sending it. */
+static struct pad_bindings wine_nx_bindings;
+static struct pad_bind_state wine_nx_bind_state;
+/* The keys the polls left held, and those pressed or let go since the last
+ * wine_nx_pad_keys_take(); a key tapped between two takes is in both. */
+static unsigned int wine_nx_pad_keys_held[8], wine_nx_pad_keys_pressed[8], wine_nx_pad_keys_released[8];
+/* Notches of the wheel not yet taken, up positive. */
+static int wine_nx_pad_wheel;
 /* The position Wine last had, from a take or the program's SetCursorPos. */
 static int wine_nx_pointer_sent_x = WINE_NX_FB_W / 2, wine_nx_pointer_sent_y = WINE_NX_FB_H / 2;
 
@@ -826,30 +836,16 @@ void wine_nx_keyboard_open( void )
     wine_nx_osk_show( 1, __atomic_load_n( &osk_last_held, __ATOMIC_RELAXED ) );
 }
 
-/* Buttons reported by wine_nx_pointer_poll(). */
-#define WINE_NX_POINTER_LEFT  0x1
-#define WINE_NX_POINTER_RIGHT 0x2
+/* Buttons reported by wine_nx_pointer_poll(): PAD_MOUSE_BIT of each of
+ * pad_bindings.h's mouse buttons. */
+#define WINE_NX_POINTER_LEFT  PAD_MOUSE_BIT(PAD_MOUSE_LEFT)
 
-/* The console has no keyboard, so the controller stands in for one. These are
- * the controls that send keys, in the order of the bits in
- * wine_nx_pad_key_state. A and B are the mouse buttons unless given a key.
- * sdmc:/switch/wine/keys.txt overrides the virtual-key codes, one NAME=code
- * line each, and a program's own NAME.keys.txt next to it overrides those, so
- * a game that wants other keys needs no new build. */
-enum
-{
-    WINE_NX_KEY_UP, WINE_NX_KEY_DOWN, WINE_NX_KEY_LEFT, WINE_NX_KEY_RIGHT,
-    WINE_NX_KEY_X, WINE_NX_KEY_Y, WINE_NX_KEY_L, WINE_NX_KEY_R,
-    WINE_NX_KEY_ZL, WINE_NX_KEY_ZR, WINE_NX_KEY_PLUS, WINE_NX_KEY_MINUS,
-    WINE_NX_KEY_STICKL, WINE_NX_KEY_STICKR, WINE_NX_KEY_A, WINE_NX_KEY_B,
-    /* Each of the three things that point, for a game that walks with one set
-     * of keys and works its menus with another. The left stick sends what the
-     * d-pad does until it is given keys of its own. */
-    WINE_NX_KEY_LUP, WINE_NX_KEY_LDOWN, WINE_NX_KEY_LLEFT, WINE_NX_KEY_LRIGHT,
-    WINE_NX_KEY_RUP, WINE_NX_KEY_RDOWN, WINE_NX_KEY_RLEFT, WINE_NX_KEY_RRIGHT,
-    WINE_NX_KEY_TUP, WINE_NX_KEY_TDOWN, WINE_NX_KEY_TLEFT, WINE_NX_KEY_TRIGHT,
-    WINE_NX_KEY_COUNT
-};
+/* The console has no keyboard, so the controller stands in for one. The
+ * controls that can send something are pad_bindings.h's WINE_NX_KEY_*, a bit
+ * each. sdmc:/switch/wine/keys.txt overrides what they send, one NAME=action
+ * line each and MOD+NAME=action for a combination, and a program's own
+ * NAME.keys.txt next to it overrides those, so a game that wants other keys
+ * needs no new build. */
 
 /* What each of them does: move the mouse, or send its four keys. */
 enum { WINE_NX_DEVICE_LEFT, WINE_NX_DEVICE_RIGHT, WINE_NX_DEVICE_DPAD, WINE_NX_DEVICE_TOUCH,
@@ -874,7 +870,7 @@ static const char *const wine_nx_pad_key_names[WINE_NX_KEY_COUNT] =
 /* Defaults that suit a game: the d-pad and left stick steer, the triggers
  * accelerate and brake, and the face and shoulder buttons carry what a keyboard
  * usually has under the left hand. */
-unsigned short wine_nx_pad_keys[WINE_NX_KEY_COUNT] =
+static const unsigned short wine_nx_pad_keys[WINE_NX_KEY_COUNT] =
 {
     0x26, 0x28, 0x25, 0x27,  /* arrows */
     0x20, 0x46,              /* X space, Y f */
@@ -888,11 +884,45 @@ unsigned short wine_nx_pad_keys[WINE_NX_KEY_COUNT] =
     0x26, 0x28, 0x25, 0x27,  /* and a finger dragged across the screen */
 };
 
-/* Which of those controls are held, read by the display driver's ProcessEvents
- * (dlls/win32u/winnx_drv.c), which turns the changes into key events. Zeroed
- * while a program reads the controller through XInput (below), so it never
- * competes with what the program reads there itself. */
-unsigned int wine_nx_pad_key_state;
+/* How far a stick goes before it is pressing its direction. */
+#define WINE_NX_STICK_PRESS 12000
+
+/* The keys the controller sends, for the display driver's ProcessEvents
+ * (dlls/win32u/winnx_drv.c), which turns them into key events: those held
+ * now, and those pressed and let go since the last take, so that a press
+ * shorter than the time between two takes, or a tap, is still sent. Nothing
+ * is held while a program reads the controller through XInput (below), so it
+ * never competes with what the program reads there itself. */
+void wine_nx_pad_keys_take( unsigned int held[8], unsigned int pressed[8], unsigned int released[8],
+                            int *wheel )
+{
+    pthread_mutex_lock( &wine_nx_pointer_mutex );
+    memcpy( held, wine_nx_pad_keys_held, sizeof(wine_nx_pad_keys_held) );
+    memcpy( pressed, wine_nx_pad_keys_pressed, sizeof(wine_nx_pad_keys_pressed) );
+    memcpy( released, wine_nx_pad_keys_released, sizeof(wine_nx_pad_keys_released) );
+    memset( wine_nx_pad_keys_pressed, 0, sizeof(wine_nx_pad_keys_pressed) );
+    memset( wine_nx_pad_keys_released, 0, sizeof(wine_nx_pad_keys_released) );
+    *wheel = wine_nx_pad_wheel;
+    wine_nx_pad_wheel = 0;
+    pthread_mutex_unlock( &wine_nx_pointer_mutex );
+}
+
+/* Keep what a step of the bindings sent until the display driver takes it.
+ * Called with wine_nx_pointer_mutex held. */
+static void wine_nx_pad_keys_update( const struct pad_bind_output *out )
+{
+    unsigned int i;
+
+    for (i = 0; i < 8; i++)
+    {
+        unsigned int old = wine_nx_pad_keys_held[i], now = out->keys[i];
+
+        wine_nx_pad_keys_pressed[i] |= (now & ~old) | out->keys_tapped[i];
+        wine_nx_pad_keys_released[i] |= (old & ~now) | out->keys_tapped[i];
+        wine_nx_pad_keys_held[i] = now;
+    }
+    wine_nx_pad_wheel += out->wheel;
+}
 
 /* When a program last read the controller through XInput (xinput_unix.c). */
 extern u64 wine_nx_xinput_last_poll;
@@ -913,7 +943,7 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
 {
     HidTouchScreenState touch = {0};
     HidAnalogStickState stick;
-    unsigned int pressed = 0;
+    unsigned int pressed = 0, tapped = 0;
     u64 now, held, all_held, xinput_poll;
     int moved, gamepad, leave = 0, keyboard = 0, on_keyboard = 0;
     static int osk_combo;
@@ -1036,11 +1066,10 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
                                           armTicksToNs( now - wine_nx_pointer_tick ) );
     }
     wine_nx_pointer_tick = now;
-    if (!gamepad && (held & HidNpadButton_A) && !wine_nx_pad_keys[WINE_NX_KEY_A]) pressed |= WINE_NX_POINTER_LEFT;
-    if (!gamepad && (held & HidNpadButton_B) && !wine_nx_pad_keys[WINE_NX_KEY_B]) pressed |= WINE_NX_POINTER_RIGHT;
     {
         /* The left stick steers as well as the d-pad, past a dead zone. */
         HidAnalogStickState steer = padGetStickPos( &wine_nx_pad, 0 );
+        struct pad_bind_output out;
         static const struct { u64 button; int key; } buttons[] =
         {
             { HidNpadButton_X, WINE_NX_KEY_X }, { HidNpadButton_Y, WINE_NX_KEY_Y },
@@ -1051,7 +1080,7 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
             /* The d-pad's four are left out when it is moving the mouse. */
             { HidNpadButton_Up, WINE_NX_KEY_UP }, { HidNpadButton_Down, WINE_NX_KEY_DOWN },
             { HidNpadButton_Left, WINE_NX_KEY_LEFT }, { HidNpadButton_Right, WINE_NX_KEY_RIGHT },
-            { HidNpadButton_A, WINE_NX_KEY_A }, { HidNpadButton_B, WINE_NX_KEY_B },  /* sent only if given a key */
+            { HidNpadButton_A, WINE_NX_KEY_A }, { HidNpadButton_B, WINE_NX_KEY_B },
         };
         unsigned int keys = 0, i;
 
@@ -1063,21 +1092,21 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
             if (held & buttons[i].button) keys |= 1u << buttons[i].key;
         }
         /* The left stick steers with the d-pad unless it was given keys of
-         * its own: Halo walks with w, a, s and d and works its menus with the
-         * arrows, and one controller has to do both. */
+         * its own (pad_bindings_resolve): Halo walks with w, a, s and d and
+         * works its menus with the arrows, and one controller has to do both. */
         if (wine_nx_device_mode[WINE_NX_DEVICE_LEFT] == WINE_NX_PRESSES)
         {
-            if (steer.y >  12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LUP] ? WINE_NX_KEY_LUP : WINE_NX_KEY_UP);
-            if (steer.y < -12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LDOWN] ? WINE_NX_KEY_LDOWN : WINE_NX_KEY_DOWN);
-            if (steer.x < -12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LLEFT] ? WINE_NX_KEY_LLEFT : WINE_NX_KEY_LEFT);
-            if (steer.x >  12000) keys |= 1u << (wine_nx_pad_keys[WINE_NX_KEY_LRIGHT] ? WINE_NX_KEY_LRIGHT : WINE_NX_KEY_RIGHT);
+            if (steer.y >  WINE_NX_STICK_PRESS) keys |= 1u << WINE_NX_KEY_LUP;
+            if (steer.y < -WINE_NX_STICK_PRESS) keys |= 1u << WINE_NX_KEY_LDOWN;
+            if (steer.x < -WINE_NX_STICK_PRESS) keys |= 1u << WINE_NX_KEY_LLEFT;
+            if (steer.x >  WINE_NX_STICK_PRESS) keys |= 1u << WINE_NX_KEY_LRIGHT;
         }
         if (wine_nx_device_mode[WINE_NX_DEVICE_RIGHT] == WINE_NX_PRESSES)
         {
-            if (stick.y >  12000) keys |= 1u << WINE_NX_KEY_RUP;
-            if (stick.y < -12000) keys |= 1u << WINE_NX_KEY_RDOWN;
-            if (stick.x < -12000) keys |= 1u << WINE_NX_KEY_RLEFT;
-            if (stick.x >  12000) keys |= 1u << WINE_NX_KEY_RRIGHT;
+            if (stick.y >  WINE_NX_STICK_PRESS) keys |= 1u << WINE_NX_KEY_RUP;
+            if (stick.y < -WINE_NX_STICK_PRESS) keys |= 1u << WINE_NX_KEY_RDOWN;
+            if (stick.x < -WINE_NX_STICK_PRESS) keys |= 1u << WINE_NX_KEY_RLEFT;
+            if (stick.x >  WINE_NX_STICK_PRESS) keys |= 1u << WINE_NX_KEY_RRIGHT;
         }
         /* A finger held away from where it went down, by more than a tap. */
         if (wine_nx_touch_held)
@@ -1087,13 +1116,26 @@ int wine_nx_pointer_poll( int *x, int *y, unsigned int *buttons )
             if (wine_nx_touch_dx < -WINE_NX_TOUCH_STEP) keys |= 1u << WINE_NX_KEY_TLEFT;
             if (wine_nx_touch_dx >  WINE_NX_TOUCH_STEP) keys |= 1u << WINE_NX_KEY_TRIGHT;
         }
-        if (gamepad || keyboard) keys = 0;
-        __atomic_store_n( &wine_nx_pad_key_state, keys, __ATOMIC_RELAXED );
+        /* The program reading the gamepad, or the floating keyboard up, has
+         * the controller: nothing is held, and what was held is let go
+         * without a modifier's tap. */
+        if (gamepad || keyboard)
+        {
+            pad_bind_state_reset( &wine_nx_bind_state );
+            memset( &out, 0, sizeof(out) );
+        }
+        else pad_bind_step( &wine_nx_bind_state, &wine_nx_bindings, keys, armTicksToNs( now ), &out );
+        wine_nx_pad_keys_update( &out );
+        pressed |= out.mouse;
+        tapped = out.mouse_tapped & ~pressed;
     }
     *x = (int)wine_nx_pointer.x;
     *y = (int)wine_nx_pointer.y;
     *buttons = pressed;
     pointer_buttons_update( &wine_nx_pointer_buttons, pressed );
+    /* A button tapped within the poll is pressed and let go. */
+    wine_nx_pointer_buttons.pressed |= tapped;
+    wine_nx_pointer_buttons.released |= tapped;
     wine_nx_pointer_moved |= moved;
     /* + and - held together close the program, whether or not it still draws:
      * this poll runs on the display driver's thread, outside it. */
@@ -1644,9 +1686,19 @@ static int config_bool( const char *key, int fallback, const char *was, int flip
     return fallback;
 }
 
-/* switch/wine/keys.txt: one NAME=code line for each control whose key should
- * differ from the default, where code is a Windows virtual-key code, decimal or
- * 0x-prefixed. Unknown names and malformed lines are reported and skipped, so a
+/* Every control back to what it sends with no keys.txt; the files are read
+ * over this. */
+static void reset_key_map( void )
+{
+    pad_bindings_init( &wine_nx_bindings, wine_nx_pad_keys );
+    pad_bind_state_reset( &wine_nx_bind_state );
+}
+
+/* switch/wine/keys.txt: one NAME=action line for each control whose action
+ * should differ from the default, and MOD+NAME=action for a combination of two
+ * (pad_bindings.h). An action is a Windows virtual-key code, decimal or
+ * 0x-prefixed, as the file has always had it, or one of the words that file
+ * describes. Unknown names and malformed lines are reported and skipped, so a
  * typo costs one control rather than the file. */
 static void read_key_map( const char *path )
 {
@@ -1692,17 +1744,23 @@ static void read_key_map( const char *path )
                 break;
             }
         if (i < WINE_NX_DEVICE_COUNT) continue;
-        for (i = 0; i < WINE_NX_KEY_COUNT; i++)
-            if (!strcasecmp( name, wine_nx_pad_key_names[i] ))
-            {
-                wine_nx_pad_keys[i] = (unsigned short)strtoul( value, NULL, 0 );
-                changed++;
-                break;
-            }
-        if (i == WINE_NX_KEY_COUNT) log_line( "[NXINPUT] %s: unknown control '%s'", path, name );
+        {
+            struct pad_action action;
+            int mod, source;
+            char *end = name + strlen( name );
+
+            while (end > name && end[-1] == ' ') *--end = 0;
+            if (!pad_trigger_parse( name, wine_nx_pad_key_names, WINE_NX_KEY_COUNT, &mod, &source ))
+                log_line( "[NXINPUT] %s: unknown control '%s'", path, name );
+            else if (!pad_action_parse( value, &action ))
+                log_line( "[NXINPUT] %s: %s cannot send '%s'", path, name, value );
+            else if (!pad_bindings_set( &wine_nx_bindings, mod, source, &action ))
+                log_line( "[NXINPUT] %s: no room for %s, past %d combinations", path, name, PAD_BIND_COMBO_MAX );
+            else changed++;
+        }
     }
     fclose( file );
-    log_line( "[NXINPUT] %s: %u controls remapped", path, changed );
+    log_line( "[NXINPUT] %s: %u controls remapped, %d combinations", path, changed, wine_nx_bindings.combos );
 }
 
 static unsigned int close_handle_object( HANDLE handle )
@@ -3887,6 +3945,7 @@ int main( int argc, char **argv )
     runtime_profile = config_bool( "profiler", 0, "profile.txt", 0 );
     /* The key map keeps a file of its own: it is a line for each control, with
      * room for the comments that say what the codes mean. */
+    reset_key_map();
     read_key_map( CONFIG_DIR "/keys.txt" );
     read_key_map( RUNTIME_DIR "/keys.txt" );
     if (!config_bool( "display-devices", 1, "no-display-devices.txt", 1 )) wine_nx_display_devices = 0;

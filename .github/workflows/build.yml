@@ -10,14 +10,33 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
+  # The host tests of the controls, which take seconds where the build takes hours.
+  controls-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bindings
+        run: |
+          flags="-std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer"
+          for cc in gcc clang; do
+            $cc $flags horizon-wine/tests/pad_bindings.c -o /tmp/pad_bindings-$cc
+            /tmp/pad_bindings-$cc
+          done
+      - name: Key names
+        run: python3 horizon-wine/tests/check_key_names.py
+      - name: Pointer cursor
+        run: |
+          clang -std=gnu11 -Wall -Wextra -Werror horizon-wine/tests/pointer_cursor.c -o /tmp/pointer_cursor
+          /tmp/pointer_cursor
+
   autorun:
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    # One build at a time, the later waiting: a build cut short saves no cache.
+    concurrency:
+      group: build-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - name: Make room
         run: |

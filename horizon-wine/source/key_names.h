@@ -122,6 +122,16 @@ static const struct wine_nx_key_name wine_nx_key_names[] =
     { 0xbd, "Minus" },     { 0xbe, "Period" },    { 0xbf, "Slash" },
     { 0xc0, "Backtick" },  { 0xdb, "Left bracket" }, { 0xdc, "Backslash" },
     { 0xdd, "Right bracket" }, { 0xde, "Apostrophe" },
+    /* The keys an ISO or Brazilian ABNT keyboard has beside the others. */
+    { 0xe2, "ISO backslash" }, { 0xc1, "ABNT slash" }, { 0xc2, "ABNT numpad ." },
+    { 0x5b, "Windows" },       { 0x5c, "Right Windows" }, { 0x5d, "Menu" },
+    { 0xa0, "Left shift" },    { 0xa1, "Right shift" },
+    { 0xa2, "Left control" },  { 0xa3, "Right control" },
+    { 0xa4, "Left alt" },      { 0xa5, "Right alt" },
+    { 0x90, "Num lock" },      { 0x91, "Scroll lock" },
+    { 0xad, "Mute" },          { 0xae, "Volume down" },   { 0xaf, "Volume up" },
+    { 0xb3, "Play/pause" },    { 0xb2, "Stop media" },
+    { 0xb0, "Next track" },    { 0xb1, "Previous track" },
 };
 
 #define WINE_NX_KEY_NAME_COUNT ((int)(sizeof(wine_nx_key_names) / sizeof(wine_nx_key_names[0])))

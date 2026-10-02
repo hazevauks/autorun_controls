@@ -51,9 +51,12 @@ extern int   wine_nx_runtime_verbose __attribute__((weak));
  * a layer of it (horizon-wine/source/compositor.h). */
 extern int   wine_nx_compositor_enabled( void );
 
-/* Buttons reported by wine_nx_pointer_poll(). */
-#define WINE_NX_POINTER_LEFT  0x1
-#define WINE_NX_POINTER_RIGHT 0x2
+/* Buttons reported by wine_nx_pointer_poll() (horizon-wine/source/pad_bindings.h). */
+#define WINE_NX_POINTER_LEFT   0x1
+#define WINE_NX_POINTER_RIGHT  0x2
+#define WINE_NX_POINTER_MIDDLE 0x4
+#define WINE_NX_POINTER_X1     0x8
+#define WINE_NX_POINTER_X2     0x10
 
 struct wine_nx_surface
 {
@@ -593,6 +596,9 @@ static void wine_nx_pointer_flags( unsigned int last, unsigned int held, unsigne
     {
         { WINE_NX_POINTER_LEFT, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP },
         { WINE_NX_POINTER_RIGHT, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP },
+        { WINE_NX_POINTER_MIDDLE, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP },
+        /* The two side buttons share their flags and say which in mouseData,
+         * so one event takes only one of them (wine_nx_send_xbuttons). */
     };
     unsigned int i;
 
@@ -615,54 +621,135 @@ static void wine_nx_pointer_flags( unsigned int last, unsigned int held, unsigne
     }
 }
 
+static void wine_nx_send_vk( HKL layout, BYTE vk, BOOL up );
+
 /* The controller stands in for the keyboard the console does not have. The
- * runtime polls it and keeps the held controls in wine_nx_pad_key_state, with
- * the virtual-key code of each in wine_nx_pad_keys (horizon-wine/source/
- * runtime.c, overridable through switch/wine/keys.txt and a program's own
- * NAME.keys.txt). */
-#define WINE_NX_PAD_KEY_COUNT 28
-extern unsigned int wine_nx_pad_key_state __attribute__((weak));
-extern unsigned short wine_nx_pad_keys[] __attribute__((weak));
+ * runtime turns what is held into keys (horizon-wine/source/pad_bindings.h,
+ * from switch/wine/keys.txt and a program's own NAME.keys.txt) and keeps them
+ * until they are taken here: those held now, and those pressed or let go
+ * since, a bit for each virtual-key code, with the turns of the wheel. */
+extern void wine_nx_pad_keys_take( unsigned int held[8], unsigned int pressed[8], unsigned int released[8],
+                                   int *wheel ) __attribute__((weak));
+
+static void wine_nx_send_wheel( int notches );
+
+static BOOL wine_nx_modifier_vk( unsigned int vk )
+{
+    return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LWIN || vk == VK_RWIN ||
+           (vk >= VK_LSHIFT && vk <= VK_RMENU);
+}
 
 static BOOL wine_nx_send_keys(void)
 {
-    static unsigned int delivered;
-    unsigned int held, changed, i;
+    static unsigned int delivered[8];
+    unsigned int held[8], pressed[8], released[8], down[2][8], up[2][8], vk, i;
+    int wheel, phase, pass;
+    HKL layout = 0;
+    BOOL sent = FALSE;
 
-    if (!&wine_nx_pad_key_state || !wine_nx_pad_keys) return FALSE;
-    held = __atomic_load_n( &wine_nx_pad_key_state, __ATOMIC_RELAXED );
-    if (!(changed = held ^ delivered)) return FALSE;
-
-    for (i = 0; i < WINE_NX_PAD_KEY_COUNT; i++)
+    if (!&wine_nx_pad_keys_take) return FALSE;
+    wine_nx_pad_keys_take( held, pressed, released, &wheel );
+    /* The two steps that take what was delivered to what is held, as for the
+     * mouse buttons (wine_nx_pointer_flags): a key let go goes up, then down
+     * again if it was pressed again; one pressed goes down, then up again if
+     * it was let go in between. */
+    for (i = 0; i < 8; i++)
     {
-        INPUT input = {0};
-        UINT scan;
+        unsigned int lifted = delivered[i] & (released[i] | ~held[i]);
+        unsigned int fresh = ~delivered[i] & (held[i] | pressed[i]);
 
-        if (!(changed & (1u << i)) || !wine_nx_pad_keys[i]) continue;
-        input.type = INPUT_KEYBOARD;
-        input.ki.wVk = wine_nx_pad_keys[i];
-        input.ki.dwFlags = (held & (1u << i)) ? 0 : KEYEVENTF_KEYUP;
-        /* DirectInput names keys by scan code, and an arrow is E0 48, not 48. */
-        scan = NtUserMapVirtualKeyEx( input.ki.wVk, MAPVK_VK_TO_VSC_EX, NtUserGetKeyboardLayout( 0 ) );
-        input.ki.wScan = scan & 0xff;
-        if ((scan & 0xff00) == 0xe000) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
-        NtUserSendHardwareInput( 0, 0, &input, 0 );
+        up[0][i] = lifted;
+        down[1][i] = lifted & held[i];
+        down[0][i] = fresh;
+        up[1][i] = fresh & ~held[i];
+        delivered[i] = held[i];
     }
-    nxdrv_trace( "[NXINPUT] keys held=%x changed=%x", held, changed, 0, 0 );
-    delivered = held;
-    return TRUE;
+    /* Within each step the modifiers go down first and up last, so that
+     * shift+1 tapped is Shift down, 1 down, 1 up, Shift up. */
+    for (phase = 0; phase < 2; phase++)
+        for (pass = 0; pass < 4; pass++)
+        {
+            const unsigned int *keys = pass < 2 ? down[phase] : up[phase];
+            BOOL modifiers = pass == 0 || pass == 3;
+
+            for (vk = 1; vk < 256; vk++)
+            {
+                if (!(keys[vk >> 5] & (1u << (vk & 31))) || wine_nx_modifier_vk( vk ) != modifiers) continue;
+                if (!sent) layout = NtUserGetKeyboardLayout( 0 );
+                wine_nx_send_vk( layout, vk, pass >= 2 );
+                sent = TRUE;
+            }
+        }
+    if (sent) nxdrv_trace( "[NXINPUT] keys held=%x,%x,%x", held[0], held[1], held[2], 0 );
+    if (wheel)
+    {
+        wine_nx_send_wheel( wheel );
+        sent = TRUE;
+    }
+    return sent;
 }
 
 /* A touch points at a place on the screen. */
-static void wine_nx_send_mouse( int x, int y, DWORD flags )
+static void wine_nx_send_mouse_data( int x, int y, DWORD flags, DWORD data )
 {
     INPUT input = {0};
 
     input.type = INPUT_MOUSE;
     input.mi.dx = x;
     input.mi.dy = y;
+    input.mi.mouseData = data;
     input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | flags;
     NtUserSendHardwareInput( 0, 0, &input, 0 );
+}
+
+static void wine_nx_send_mouse( int x, int y, DWORD flags )
+{
+    wine_nx_send_mouse_data( x, y, flags, 0 );
+}
+
+/* The side buttons, each in events of its own (wine_nx_pointer_flags). */
+static BOOL wine_nx_send_xbuttons( int x, int y, unsigned int last, unsigned int held, unsigned int pressed,
+                                   unsigned int released )
+{
+    static const struct { unsigned int button; DWORD data; } map[] =
+    {
+        { WINE_NX_POINTER_X1, XBUTTON1 },
+        { WINE_NX_POINTER_X2, XBUTTON2 },
+    };
+    BOOL sent = FALSE;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(map); i++)
+    {
+        unsigned int button = map[i].button;
+
+        if (last & button)
+        {
+            if ((held & button) && !(released & button)) continue;
+            wine_nx_send_mouse_data( x, y, MOUSEEVENTF_XUP, map[i].data );
+            if (held & button) wine_nx_send_mouse_data( x, y, MOUSEEVENTF_XDOWN, map[i].data );
+        }
+        else if ((held | pressed) & button)
+        {
+            wine_nx_send_mouse_data( x, y, MOUSEEVENTF_XDOWN, map[i].data );
+            if (!(held & button)) wine_nx_send_mouse_data( x, y, MOUSEEVENTF_XUP, map[i].data );
+        }
+        else continue;
+        sent = TRUE;
+    }
+    return sent;
+}
+
+/* Turns of the wheel, up positive, as a mouse's are counted. */
+static void wine_nx_send_wheel( int notches )
+{
+    INPUT input = {0};
+
+    input.type = INPUT_MOUSE;
+    input.mi.mouseData = (DWORD)(notches * WHEEL_DELTA);
+    input.mi.dwFlags = MOUSEEVENTF_WHEEL;
+    NtUserSendHardwareInput( 0, 0, &input, 0 );
+    nxdrv_trace( "[NXINPUT] wheel %d", notches, 0, 0, 0 );
 }
 
 /* The stick moves by an amount, which is what a mouse does: the cursor may be
@@ -775,7 +862,7 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
     static unsigned int last_buttons;
     unsigned int buttons, pressed, released;
     DWORD first, second;
-    BOOL moved, keys, placed, stepped;
+    BOOL moved, keys, placed, stepped, xbuttons;
     int x, y, dx, dy;
 
     (void)mask;
@@ -790,6 +877,7 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
     if (placed || first) wine_nx_send_mouse( x, y, (placed ? MOUSEEVENTF_MOVE : 0) | first );
     if (stepped) wine_nx_send_mouse_motion( dx, dy );
     if (second) wine_nx_send_mouse( x, y, second );
+    xbuttons = wine_nx_send_xbuttons( x, y, last_buttons, buttons, pressed, released );
     if (moved || placed || stepped)
     {
         POINT pos;
@@ -821,7 +909,7 @@ BOOL wine_nx_drv_ProcessEvents( DWORD mask )
     keys |= wine_nx_send_keyboard_keys();
     wine_nx_update_cursor();
     wine_nx_fb_present();
-    return moved || first || keys;
+    return moved || first || keys || xbuttons;
 }
 
 /**********************************************************************

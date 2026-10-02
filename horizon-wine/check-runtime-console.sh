@@ -13,6 +13,8 @@ flags="-std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-f
 "$build/file_access"
 "${CC:-clang}" $flags "$root/horizon-wine/tests/pointer_cursor.c" -o "$build/pointer_cursor"
 "$build/pointer_cursor"
+"${CC:-clang}" $flags "$root/horizon-wine/tests/pad_bindings.c" -o "$build/pad_bindings"
+"$build/pad_bindings"
 "${CC:-clang}" $flags "$root/horizon-wine/tests/horizon_message_queue.c" -o "$build/message_queue"
 "$build/message_queue"
 "${CC:-clang}" $flags "$root/horizon-wine/tests/horizon_win_timers.c" -o "$build/win_timers"
