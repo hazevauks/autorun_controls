@@ -63,18 +63,32 @@ jobs:
       # llvm-mingw and the Atmosphere boot payloads: build.sh fetches and
       # builds them only when they are missing, and they rarely change.
       - name: Toolchains cache
-        uses: actions/cache@v4
+        id: toolchains
+        uses: actions/cache/restore@v4
         with:
-          path: |
-            horizon-wine/toolchains
+          path: horizon-wine/toolchains
           key: toolchains-${{ hashFiles('build.sh', 'horizon-wine/build-boot-bundle.sh', 'horizon-wine/switch-dev.txt') }}
 
+      # As root, like the switch-dev container: git there refuses the
+      # repositories the build fetches (vendor/box64 and the rest) when they
+      # belong to the runner's user rather than to it.
       - name: Build
-        run: sh build.sh --jobs "$(nproc)"
+        run: |
+          sudo git config --system --add safe.directory '*'
+          sudo -E env "PATH=$PATH" sh build.sh --jobs "$(nproc)"
 
       - name: Disk left
         if: always()
         run: df -h /
+
+      # Saved even when the runtime fails to build, once the boot payloads are
+      # there: they alone take twenty minutes.
+      - name: Save toolchains
+        if: always() && steps.toolchains.outputs.cache-hit != 'true' && hashFiles('horizon-wine/toolchains/boot-payloads/bundle/setup_boot_manifest.h') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: horizon-wine/toolchains
+          key: ${{ steps.toolchains.outputs.cache-primary-key }}
 
       - uses: actions/upload-artifact@v4
         with:
