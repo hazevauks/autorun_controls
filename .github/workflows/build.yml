@@ -27,8 +27,16 @@ jobs:
         run: python3 horizon-wine/tests/check_key_names.py
       - name: Pointer cursor
         run: |
-          clang -std=gnu11 -Wall -Wextra -Werror horizon-wine/tests/pointer_cursor.c -o /tmp/pointer_cursor
+          clang -std=gnu11 -Wall -Wextra -Werror horizon-wine/tests/pointer_cursor.c -lm -o /tmp/pointer_cursor
           /tmp/pointer_cursor
+      # The launcher builds on a computer too (tests/check-launcher-host.sh):
+      # compiling it here finds the Controls screen's mistakes in a minute.
+      - name: Launcher compiles
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libsdl2-dev libsdl2-ttf-dev
+          clang -std=gnu11 -Wall -Wextra -Werror -I horizon-wine/source $(sdl2-config --cflags) \
+                -c horizon-wine/source/launcher.c -o /tmp/launcher.o
 
   autorun:
     runs-on: ubuntu-latest

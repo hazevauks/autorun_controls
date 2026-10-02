@@ -3090,37 +3090,68 @@ static const struct { const char *name, *by; } credits[] =
  * step through the keys, A opens the whole list, and Y puts a control back to
  * what it sends with no line of its own.
  *
- * What is written is the same keys.txt the runtime has always read -- a
- * NAME=code line for each control that differs -- so a file written here can
- * still be edited on a computer, and one edited there opens here. */
+ * What is written is the same keys.txt the runtime reads -- a NAME=action
+ * line for each control that differs, and MOD+NAME=action for a combination
+ * (pad_bindings.h) -- so a file written here can still be edited on a
+ * computer, and one edited there opens here. */
+
+/* The action a control or a combination (trigger, as keys.txt spells it) has
+ * in the program's file or, failing that, the shared one: a program's own keys
+ * are applied over the shared ones. Returns 2 for a line of the program's
+ * own, 1 for one of the shared file's, 0 for neither. */
+static int trigger_action( const struct launcher_kv *keys, const struct launcher_kv *under, const char *trigger,
+                           struct pad_action *a )
+{
+    char value[64];
+
+    if (launcher_kv_get( keys, trigger, value, sizeof(value) ) && value[0] && pad_action_parse( value, a ))
+        return 2;
+    if (under && launcher_kv_get( under, trigger, value, sizeof(value) ) && value[0] && pad_action_parse( value, a ))
+        return 1;
+    return 0;
+}
+
+static struct pad_action control_action( const struct launcher_kv *keys, const struct launcher_kv *under,
+                                         int control )
+{
+    struct pad_action a = { PAD_ACTION_UNSET, 0, 0 };
+
+    if (trigger_action( keys, under, wine_nx_controls[control].name, &a )) return a;
+    if (wine_nx_controls[control].sends)
+    {
+        a.type = PAD_ACTION_KEY;
+        a.code = (unsigned char)wine_nx_controls[control].sends;
+    }
+    return a;
+}
+
+/* The key a control sends with nothing held with it, 0 for its default with
+ * none, or 0x100 for anything else. */
 static unsigned short control_key( const struct launcher_kv *keys, const struct launcher_kv *under,
                                    int control )
 {
-    const char *name = wine_nx_controls[control].name;
-    char value[64];
+    struct pad_action a = control_action( keys, under, control );
 
-    if (launcher_kv_get( keys, name, value, sizeof(value) ) && value[0])
-        return (unsigned short)strtoul( value, NULL, 0 );
-    /* A program's own keys are applied over the shared ones, so a control the
-     * program says nothing about shows what the shared file gives it. */
-    if (under && launcher_kv_get( under, name, value, sizeof(value) ) && value[0])
-        return (unsigned short)strtoul( value, NULL, 0 );
-    return wine_nx_controls[control].sends;
+    if (a.type == PAD_ACTION_UNSET) return 0;
+    return a.type == PAD_ACTION_KEY && !a.mods ? a.code : 0x100;
+}
+
+/* Back to the default (a NULL action) is the line taken away, not a line
+ * saying the default: a later build that changes what a control sends should
+ * reach a controller nobody has touched. */
+static void set_trigger_action( struct launcher_kv *keys, const char *trigger, const struct pad_action *a )
+{
+    char value[48];
+
+    launcher_kv_set( keys, trigger, a ? pad_action_format( a, value, sizeof(value) ) : NULL );
 }
 
 static void set_control_key( struct launcher_kv *keys, int control, int code )
 {
-    char value[32];
+    struct pad_action a = { PAD_ACTION_KEY, (unsigned char)code, 0 };
 
-    /* Back to the default is the line taken away, not a line saying the
-     * default: a later build that changes what a control sends should reach a
-     * controller nobody has touched. */
-    if (code < 0) launcher_kv_set( keys, wine_nx_controls[control].name, NULL );
-    else
-    {
-        snprintf( value, sizeof(value), "0x%02x", code );
-        launcher_kv_set( keys, wine_nx_controls[control].name, value );
-    }
+    if (code == 0) a.type = PAD_ACTION_NONE;
+    set_trigger_action( keys, wine_nx_controls[control].name, code < 0 ? NULL : &a );
 }
 
 /* What one of the three that point is set to do. The keys file says it in
@@ -3191,38 +3222,298 @@ static enum device_choice next_device_choice( int device, enum device_choice fro
     }
 }
 
-/* The whole list of keys, starting on the one the control sends now. Returns
- * the code chosen, or -1 for the way out. */
-static int key_screen( struct launcher *l, const char *control_label, unsigned short current )
+/* A list to choose one of, as a screen of its own: the lists of keys and of
+ * controls are longer than a menu holds. Returns the row chosen, or -1 for the
+ * way out. */
+static int pick_screen( struct launcher *l, const char *title, const char *const *labels,
+                        const char *const *values, int count, int selection )
 {
-    static struct ui_row rows[WINE_NX_KEY_NAME_COUNT];
+    static struct ui_row rows[WINE_NX_KEY_NAME_COUNT + WINE_NX_CONTROL_COUNT];
     struct ui_list list = {0};
-    char title[128];
-    int i, at = wine_nx_key_index( current );
+    int i;
 
+    if (count > (int)(sizeof(rows) / sizeof(rows[0]))) count = sizeof(rows) / sizeof(rows[0]);
     memset( rows, 0, sizeof(rows) );
-    for (i = 0; i < WINE_NX_KEY_NAME_COUNT; i++)
+    for (i = 0; i < count; i++)
     {
-        snprintf( rows[i].label, sizeof(rows[i].label), "%s", wine_nx_key_names[i].name );
-        if (wine_nx_key_names[i].code)
-            snprintf( rows[i].value, sizeof(rows[i].value), "0x%02x", wine_nx_key_names[i].code );
+        snprintf( rows[i].label, sizeof(rows[i].label), "%s", labels[i] );
+        if (values && values[i]) snprintf( rows[i].value, sizeof(rows[i].value), "%s", values[i] );
     }
-    snprintf( title, sizeof(title), "%s sends", control_label );
-    list.selection = at > 0 ? at : 0;
+    list.selection = selection >= 0 && selection < count ? selection : 0;
     for (;;)
     {
-        enum ui_action action = ui_list_run( &l->ui, &list, title, "Controls", rows,
-                                             WINE_NX_KEY_NAME_COUNT, 0 );
+        enum ui_action action = ui_list_run( &l->ui, &list, title, "Controls", rows, count, 0 );
 
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) return -1;
-        if (action == UI_ACTION_CHOOSE) return wine_nx_key_names[list.selection].code;
+        if (action == UI_ACTION_CHOOSE) return list.selection;
     }
+}
+
+/* The keys of one group, starting on current. Returns the code, or -1. */
+static int key_screen( struct launcher *l, const char *title, int category, unsigned short current )
+{
+    const char *labels[WINE_NX_KEY_NAME_COUNT];
+    unsigned short codes[WINE_NX_KEY_NAME_COUNT];
+    int i, count = 0, at = 0, picked;
+
+    for (i = 0; i < WINE_NX_KEY_NAME_COUNT; i++)
+    {
+        if (!wine_nx_key_names[i].code || wine_nx_key_category( wine_nx_key_names[i].code ) != category) continue;
+        if (wine_nx_key_names[i].code == current) at = count;
+        codes[count] = wine_nx_key_names[i].code;
+        labels[count++] = wine_nx_key_names[i].name;
+    }
+    picked = pick_screen( l, title, labels, NULL, count, at );
+    ui_start_screen( &l->ui );
+    return picked < 0 ? -1 : codes[picked];
+}
+
+/* What a control or a combination sends, chosen in two steps: what kind of
+ * thing, then which. Returns 0 for the way out. */
+static int action_screen( struct launcher *l, const char *label, const struct pad_action *current,
+                          struct pad_action *out )
+{
+    enum { KIND_NOTHING, KIND_MOUSE, KIND_KEYS, KIND_HELD = KIND_KEYS + WINE_NX_KEYS_CATEGORY_COUNT, KIND_COUNT };
+    static const char *const mouse[] =
+        { "Left mouse button", "Right mouse button", "Middle mouse button", "Mouse back (X1)",
+          "Mouse forward (X2)", "Wheel up", "Wheel down" };
+    static const char *const held[] = { "Shift", "Ctrl", "Alt", "Ctrl+Shift", "Ctrl+Alt", "Alt+Shift", "Windows" };
+    static const unsigned char held_mods[] =
+        { PAD_MOD_SHIFT, PAD_MOD_CTRL, PAD_MOD_ALT, PAD_MOD_CTRL | PAD_MOD_SHIFT, PAD_MOD_CTRL | PAD_MOD_ALT,
+          PAD_MOD_ALT | PAD_MOD_SHIFT, PAD_MOD_WIN };
+    const char *kinds[KIND_COUNT];
+    char title[128];
+    int kind = KIND_NOTHING, i;
+
+    kinds[KIND_NOTHING] = "Nothing";
+    kinds[KIND_MOUSE] = "Mouse buttons and wheel";
+    for (i = 0; i < WINE_NX_KEYS_CATEGORY_COUNT; i++) kinds[KIND_KEYS + i] = wine_nx_key_category_names[i];
+    kinds[KIND_HELD] = "A key with Shift, Ctrl or Alt";
+    if (current->type == PAD_ACTION_MOUSE || current->type == PAD_ACTION_WHEEL) kind = KIND_MOUSE;
+    else if (current->type == PAD_ACTION_KEY && current->mods) kind = KIND_HELD;
+    else if (current->type == PAD_ACTION_KEY) kind = KIND_KEYS + wine_nx_key_category( current->code );
+    snprintf( title, sizeof(title), "%s sends", label );
+
+    for (;;)
+    {
+        struct pad_action a = { PAD_ACTION_KEY, 0, 0 };
+        int category, code;
+
+        kind = pick_screen( l, title, kinds, NULL, KIND_COUNT, kind );
+        ui_start_screen( &l->ui );
+        if (kind < 0) return 0;
+        if (kind == KIND_NOTHING)
+        {
+            out->type = PAD_ACTION_NONE;
+            out->code = out->mods = 0;
+            return 1;
+        }
+        if (kind == KIND_MOUSE)
+        {
+            int chosen = ui_menu( &l->ui, title, mouse, sizeof(mouse) / sizeof(mouse[0]), 0 );
+
+            ui_start_screen( &l->ui );
+            if (chosen < 0) continue;
+            if (chosen < PAD_MOUSE_COUNT - 1)
+            {
+                a.type = PAD_ACTION_MOUSE;
+                a.code = (unsigned char)(chosen + 1);
+            }
+            else
+            {
+                a.type = PAD_ACTION_WHEEL;
+                a.code = chosen == PAD_MOUSE_COUNT - 1 ? PAD_WHEEL_UP : PAD_WHEEL_DOWN;
+            }
+            *out = a;
+            return 1;
+        }
+        if (kind == KIND_HELD)
+        {
+            int with = ui_menu( &l->ui, "Held with the key", held, sizeof(held) / sizeof(held[0]), 0 );
+
+            ui_start_screen( &l->ui );
+            if (with < 0) continue;
+            a.mods = held_mods[with];
+            category = pick_screen( l, title, wine_nx_key_category_names, NULL, WINE_NX_KEYS_CATEGORY_COUNT,
+                                    current->type == PAD_ACTION_KEY ? wine_nx_key_category( current->code ) : 0 );
+            ui_start_screen( &l->ui );
+            if (category < 0) continue;
+        }
+        else category = kind - KIND_KEYS;
+        code = key_screen( l, title, category, current->type == PAD_ACTION_KEY ? current->code : 0 );
+        if (code < 0) continue;
+        a.code = (unsigned char)code;
+        *out = a;
+        return 1;
+    }
+}
+
+/* A combination a file holds: hold mod, press source (wine_nx_controls). */
+struct combo_line
+{
+    int mod, source, own;
+    struct pad_action action;
+};
+
+#define COMBO_LINES_MAX (2 * PAD_BIND_COMBO_MAX)
+
+/* The MOD+NAME lines of a file, after those already in lines. */
+static int read_combo_lines( const struct launcher_kv *kv, int own, struct combo_line *lines, int count )
+{
+    size_t pos = 0;
+
+    while (pos < kv->size && count < COMBO_LINES_MAX)
+    {
+        char text[128], *name = text, *value, *plus, *end;
+        size_t start = pos, length;
+        int mod, source, i;
+
+        while (pos < kv->size && kv->text[pos] != '\n') pos++;
+        length = pos - start < sizeof(text) - 1 ? pos - start : sizeof(text) - 1;
+        if (pos < kv->size) pos++;
+        memcpy( text, kv->text + start, length );
+        text[length] = 0;
+        while (*name == ' ' || *name == '\t') name++;
+        if (*name == '#' || !(value = strchr( name, '=' )) || !(plus = strchr( name, '+' )) || plus > value)
+            continue;
+        *value++ = 0;
+        for (end = name + strlen( name ); end > name && (end[-1] == ' ' || end[-1] == '\t'); end--) end[-1] = 0;
+        mod = wine_nx_control_index( name, plus - name );
+        source = wine_nx_control_index( plus + 1, strlen( plus + 1 ) );
+        if (mod < 0 || source < 0 || mod == source) continue;
+        for (i = 0; i < count; i++)
+            if (lines[i].mod == mod && lines[i].source == source) break;
+        if (i < count || !pad_action_parse( value, &lines[count].action )) continue;
+        lines[count].mod = mod;
+        lines[count].source = source;
+        lines[count].own = own;
+        count++;
+    }
+    return count;
+}
+
+/* The controls the runtime keeps for itself, held together: Minus with the
+ * right stick pressed opens the floating keyboard, and Plus with Minus closes
+ * the program. */
+static int combo_reserved( int mod, int source )
+{
+    const char *a = wine_nx_controls[mod].name, *b = wine_nx_controls[source].name;
+
+    return (!strcmp( a, "MINUS" ) && !strcmp( b, "STICKR" )) || (!strcmp( a, "STICKR" ) && !strcmp( b, "MINUS" )) ||
+           (!strcmp( a, "PLUS" ) && !strcmp( b, "MINUS" )) || (!strcmp( a, "MINUS" ) && !strcmp( b, "PLUS" ));
+}
+
+/* The combinations: a control held, then another pressed, sends something of
+ * its own -- the keys a game has more of than a controller has buttons. The
+ * first row adds one; A changes what one sends, and Y takes it away. A
+ * program's screen shows the shared ones too, and taking one of those away
+ * there turns it off for the program alone. Returns whether keys changed. */
+static int combos_screen( struct launcher *l, struct launcher_kv *keys, const struct launcher_kv *under )
+{
+    static struct combo_line lines[COMBO_LINES_MAX];
+    static struct ui_row rows[COMBO_LINES_MAX + 1];
+    const char *labels[WINE_NX_CONTROL_COUNT];
+    struct ui_list list = {0};
+    int changed = 0, count, i;
+
+    for (i = 0; i < WINE_NX_CONTROL_COUNT; i++) labels[i] = wine_nx_controls[i].label;
+    for (;;)
+    {
+        enum ui_action action;
+        char trigger[32], label[64];
+        struct pad_action a;
+
+        count = read_combo_lines( keys, 1, lines, 0 );
+        if (under) count = read_combo_lines( under, 0, lines, count );
+        memset( rows, 0, sizeof(rows) );
+        snprintf( rows[0].label, sizeof(rows[0].label), "Add a combination" );
+        rows[0].kind = UI_ROW_ACTION;
+        rows[0].help = "Hold one control, press another, and send a key, a mouse button or the wheel. "
+                       "The control held first then sends its own key only when tapped alone.";
+        for (i = 0; i < count; i++)
+        {
+            struct ui_row *row = &rows[i + 1];
+
+            snprintf( row->label, sizeof(row->label), "%s + %s", wine_nx_controls[lines[i].mod].label,
+                      wine_nx_controls[lines[i].source].label );
+            wine_nx_action_label( -1, &lines[i].action, label, sizeof(label) );
+            snprintf( row->value, sizeof(row->value), "%s%s", label, lines[i].own ? "" : " (shared)" );
+            row->kind = UI_ROW_VALUE;
+            row->adjustable = 1;
+            row->help = lines[i].own ? "A changes what it sends; Y takes it away."
+                                     : "From the controls every game uses. Y turns it off for this game.";
+        }
+        if (list.selection > count) list.selection = count;
+        action = ui_list_run( &l->ui, &list, "Combinations", "Controls", rows, count + 1, 1 );
+        if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) break;
+
+        if (list.selection == 0)
+        {
+            int mod, source;
+
+            if (action != UI_ACTION_CHOOSE) continue;
+            if (count >= PAD_BIND_COMBO_MAX)
+            {
+                ui_message( &l->ui, "Combinations", "That is as many as a game can have." );
+                ui_start_screen( &l->ui );
+                continue;
+            }
+            mod = pick_screen( l, "Hold", labels, NULL, WINE_NX_CONTROL_COUNT, 0 );
+            ui_start_screen( &l->ui );
+            if (mod < 0) continue;
+            snprintf( label, sizeof(label), "Hold %s, then press", wine_nx_controls[mod].label );
+            source = pick_screen( l, label, labels, NULL, WINE_NX_CONTROL_COUNT, 0 );
+            ui_start_screen( &l->ui );
+            if (source < 0) continue;
+            if (source == mod || combo_reserved( mod, source ))
+            {
+                ui_message( &l->ui, "Combinations", source == mod ? "A combination is two different controls."
+                            : "Autorun keeps that one: Minus with the right stick opens the keyboard, "
+                              "and Plus with Minus closes the game." );
+                ui_start_screen( &l->ui );
+                continue;
+            }
+            snprintf( label, sizeof(label), "%s + %s", wine_nx_controls[mod].label, wine_nx_controls[source].label );
+            snprintf( trigger, sizeof(trigger), "%s+%s", wine_nx_controls[mod].name, wine_nx_controls[source].name );
+            a.type = PAD_ACTION_NONE;
+            a.code = a.mods = 0;
+            trigger_action( keys, under, trigger, &a );
+            if (!action_screen( l, label, &a, &a )) continue;
+            set_trigger_action( keys, trigger, &a );
+            changed = 1;
+            continue;
+        }
+
+        i = list.selection - 1;
+        snprintf( trigger, sizeof(trigger), "%s+%s", wine_nx_controls[lines[i].mod].name,
+                  wine_nx_controls[lines[i].source].name );
+        if (action == UI_ACTION_CHOOSE)
+        {
+            snprintf( label, sizeof(label), "%s + %s", wine_nx_controls[lines[i].mod].label,
+                      wine_nx_controls[lines[i].source].label );
+            if (!action_screen( l, label, &lines[i].action, &a )) continue;
+            set_trigger_action( keys, trigger, &a );
+            changed = 1;
+        }
+        else if (action == UI_ACTION_RESET)
+        {
+            /* The program's own line goes; a shared one is answered with none. */
+            a.type = PAD_ACTION_NONE;
+            a.code = a.mods = 0;
+            set_trigger_action( keys, trigger, lines[i].own ? NULL : &a );
+            changed = 1;
+        }
+    }
+    return changed;
 }
 
 static void controls_screen( struct launcher *l, const char *path, const char *under_path,
                              const char *title )
 {
-    struct ui_row rows[WINE_NX_DEVICE_COUNT_UI + WINE_NX_CONTROL_COUNT];
+    /* The combinations first, then the three that point, then each control. */
+    enum { ROW_COMBOS, ROW_DEVICES, ROW_CONTROLS = ROW_DEVICES + WINE_NX_DEVICE_COUNT_UI,
+           ROW_COUNT = ROW_CONTROLS + WINE_NX_CONTROL_COUNT };
+    struct ui_row rows[ROW_COUNT];
     struct launcher_kv keys, under;
     struct ui_list list = {0};
     int changed = 0, i;
@@ -3237,32 +3528,45 @@ static void controls_screen( struct launcher *l, const char *path, const char *u
     for (;;)
     {
         const struct launcher_kv *base = under_path ? &under : NULL;
+        struct combo_line lines[COMBO_LINES_MAX];
         enum ui_action action;
         char label[64];
-        unsigned short code;
-        int device;
+        struct pad_action current;
+        int device, combos;
 
         memset( rows, 0, sizeof(rows) );
+        combos = read_combo_lines( &keys, 1, lines, 0 );
+        if (base) combos = read_combo_lines( base, 0, lines, combos );
+        snprintf( rows[ROW_COMBOS].label, sizeof(rows[0].label), "Combinations" );
+        if (combos) snprintf( rows[ROW_COMBOS].value, sizeof(rows[0].value), "%d", combos );
+        rows[ROW_COMBOS].kind = UI_ROW_ACTION;
+        rows[ROW_COMBOS].help = "Hold one control and press another to send a key of its own, for the "
+                                "games with more keys than a controller has buttons.";
         for (device = 0; device < WINE_NX_DEVICE_COUNT_UI; device++)
         {
-            snprintf( rows[device].label, sizeof(rows[0].label), "%s", wine_nx_devices[device].label );
-            snprintf( rows[device].value, sizeof(rows[0].value), "%s",
+            struct ui_row *row = &rows[ROW_DEVICES + device];
+
+            snprintf( row->label, sizeof(row->label), "%s", wine_nx_devices[device].label );
+            snprintf( row->value, sizeof(row->value), "%s",
                       device_choice_names[device_choice( &keys, base, device )] );
-            rows[device].adjustable = 1;
-            rows[device].kind = UI_ROW_VALUE;
-            rows[device].help = "Move the mouse, or send four keys. A game played with the mouse "
-                                "wants both sticks on it; one played with the keyboard wants the "
-                                "keys it walks with.";
+            row->adjustable = 1;
+            row->kind = UI_ROW_VALUE;
+            row->help = "Move the mouse, or send four keys. A game played with the mouse "
+                        "wants both sticks on it; one played with the keyboard wants the "
+                        "keys it walks with.";
         }
         for (i = 0; i < WINE_NX_CONTROL_COUNT; i++)
         {
-            struct ui_row *row = &rows[WINE_NX_DEVICE_COUNT_UI + i];
+            struct ui_row *row = &rows[ROW_CONTROLS + i];
 
+            current = control_action( &keys, base, i );
             snprintf( row->label, sizeof(row->label), "%s", wine_nx_controls[i].label );
             snprintf( row->value, sizeof(row->value), "%s",
-                      wine_nx_key_label( i, control_key( &keys, base, i ), label, sizeof(label) ) );
+                      wine_nx_action_label( i, &current, label, sizeof(label) ) );
             row->adjustable = 1;
             row->kind = UI_ROW_VALUE;
+            row->help = "A chooses a key, a mouse button or the wheel; left and right step through "
+                        "the keys; Y puts it back.";
             /* A stick on the mouse has no keys to give: say so rather than
              * offer four rows that do nothing. */
             for (device = 0; device < WINE_NX_DEVICE_COUNT_UI; device++)
@@ -3274,44 +3578,55 @@ static void controls_screen( struct launcher *l, const char *path, const char *u
                 row->disabled = 1;
             }
         }
-        rows[WINE_NX_DEVICE_COUNT_UI].help =
-            "A and B are the mouse buttons until they are given a key of their own.";
-        action = ui_list_run( &l->ui, &list, title, "Controls", rows,
-                              WINE_NX_DEVICE_COUNT_UI + WINE_NX_CONTROL_COUNT, 1 );
+        rows[ROW_CONTROLS].help =
+            "A and B are the mouse buttons until they are given something else; any control can be "
+            "a mouse button.";
+        action = ui_list_run( &l->ui, &list, title, "Controls", rows, ROW_COUNT, 1 );
         if (action == UI_ACTION_BACK || action == UI_ACTION_QUIT) break;
-        if (list.selection < WINE_NX_DEVICE_COUNT_UI)
+        if (list.selection == ROW_COMBOS)
         {
-            enum device_choice choice = device_choice( &keys, base, list.selection );
+            if (action != UI_ACTION_CHOOSE) continue;
+            changed |= combos_screen( l, &keys, base );
+            ui_start_screen( &l->ui );
+            continue;
+        }
+        if (list.selection < ROW_CONTROLS)
+        {
+            int at = list.selection - ROW_DEVICES;
+            enum device_choice choice = device_choice( &keys, base, at );
 
             if (action == UI_ACTION_LEFT || action == UI_ACTION_RIGHT || action == UI_ACTION_CHOOSE)
             {
-                set_device_choice( &keys, list.selection,
-                                   next_device_choice( list.selection, choice,
-                                                       action != UI_ACTION_LEFT ) );
+                set_device_choice( &keys, at, next_device_choice( at, choice, action != UI_ACTION_LEFT ) );
                 changed = 1;
             }
             else if (action == UI_ACTION_RESET)
             {
-                launcher_kv_set( &keys, wine_nx_devices[list.selection].name, NULL );
+                launcher_kv_set( &keys, wine_nx_devices[at].name, NULL );
                 changed = 1;
             }
             continue;
         }
-        i = list.selection - WINE_NX_DEVICE_COUNT_UI;
-        code = control_key( &keys, base, i );
+        i = list.selection - ROW_CONTROLS;
+        current = control_action( &keys, base, i );
         switch (action)
         {
         case UI_ACTION_CHOOSE:
         {
-            int picked = key_screen( l, wine_nx_controls[i].label, code );
+            struct pad_action picked;
 
+            if (action_screen( l, wine_nx_controls[i].label, &current, &picked ))
+            {
+                set_trigger_action( &keys, wine_nx_controls[i].name, &picked );
+                changed = 1;
+            }
             ui_start_screen( &l->ui );
-            if (picked >= 0 && picked != code) { set_control_key( &keys, i, picked ); changed = 1; }
             break;
         }
         case UI_ACTION_LEFT:
         case UI_ACTION_RIGHT:
         {
+            unsigned short code = control_key( &keys, base, i );
             int at = wine_nx_key_index( code );
 
             /* A code the list does not name steps from the start rather than

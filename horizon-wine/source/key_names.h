@@ -1,17 +1,19 @@
 /*
  * The controls a Switch has, and the keys they can be made to send.
  *
- * keys.txt is a NAME=code line for each control, where code is a Windows
- * virtual-key code; the launcher's Controls screen writes those lines, so it
- * needs the same names the runtime reads and a readable name for each code to
- * put on the screen. A code with no name here is shown as its number, which is
- * what a hand-written file may hold.
+ * keys.txt is a NAME=action line for each control, and MOD+NAME=action for a
+ * combination of two (pad_bindings.h); the launcher's Controls screen writes
+ * those lines, so it needs the same names the runtime reads and a readable
+ * name for each key to put on the screen. A code with no name here is shown as
+ * its number, which is what a hand-written file may hold.
  */
 #ifndef WINE_NX_KEY_NAMES_H
 #define WINE_NX_KEY_NAMES_H
 
 #include <stddef.h>
 #include <stdio.h>
+
+#include "pad_bindings.h"
 
 struct wine_nx_control
 {
@@ -158,6 +160,77 @@ static inline const char *wine_nx_key_label( int control, unsigned short code, c
         snprintf( out, size, "%s", wine_nx_controls[control].unset );
     else if (i >= 0) snprintf( out, size, "%s", wine_nx_key_names[i].name );
     else snprintf( out, size, "0x%02x", code );
+    return out;
+}
+
+/* The control called name, or -1. */
+static inline int wine_nx_control_index( const char *name, size_t length )
+{
+    int i;
+
+    for (i = 0; i < WINE_NX_CONTROL_COUNT; i++)
+        if (strlen( wine_nx_controls[i].name ) == length && !strncasecmp( name, wine_nx_controls[i].name, length ))
+            return i;
+    return -1;
+}
+
+/* The keys in groups, so that a list of over a hundred is a few short ones. */
+enum wine_nx_key_category
+{
+    WINE_NX_KEYS_LETTERS, WINE_NX_KEYS_NUMBERS, WINE_NX_KEYS_PUNCTUATION, WINE_NX_KEYS_FUNCTION,
+    WINE_NX_KEYS_EDITING, WINE_NX_KEYS_MODIFIERS, WINE_NX_KEYS_NUMPAD, WINE_NX_KEYS_MEDIA,
+    WINE_NX_KEYS_CATEGORY_COUNT
+};
+
+static const char *const wine_nx_key_category_names[WINE_NX_KEYS_CATEGORY_COUNT] =
+{
+    "Letters", "Numbers", "Punctuation", "F1 to F12",
+    "Enter, arrows and editing", "Shift, Ctrl, Alt and locks", "Numpad", "Volume and media",
+};
+
+static inline int wine_nx_key_category( unsigned short code )
+{
+    if (code >= 0x41 && code <= 0x5a) return WINE_NX_KEYS_LETTERS;
+    if (code >= 0x30 && code <= 0x39) return WINE_NX_KEYS_NUMBERS;
+    if (code >= 0x70 && code <= 0x87) return WINE_NX_KEYS_FUNCTION;
+    if ((code >= 0x60 && code <= 0x6f) || code == 0xc2) return WINE_NX_KEYS_NUMPAD;
+    if ((code >= 0xba && code <= 0xc1) || (code >= 0xdb && code <= 0xdf) || code == 0xe2)
+        return WINE_NX_KEYS_PUNCTUATION;
+    if ((code >= 0x10 && code <= 0x12) || code == 0x14 || (code >= 0x5b && code <= 0x5d) ||
+        code == 0x90 || code == 0x91 || (code >= 0xa0 && code <= 0xa5))
+        return WINE_NX_KEYS_MODIFIERS;
+    if (code >= 0xad && code <= 0xb3) return WINE_NX_KEYS_MEDIA;
+    return WINE_NX_KEYS_EDITING;
+}
+
+static const char *const wine_nx_mouse_labels[PAD_MOUSE_COUNT] =
+    { "Nothing", "Left mouse button", "Right mouse button", "Middle mouse button", "Mouse back (X1)",
+      "Mouse forward (X2)" };
+
+/* What to show for a control, or a combination when control is -1, set to an
+ * action: a key with what is held with it (Shift+1), a mouse button, the
+ * wheel, or what the control does with no action of its own. */
+static inline const char *wine_nx_action_label( int control, const struct pad_action *a, char *out, size_t size )
+{
+    char key[48];
+
+    switch (a->type)
+    {
+    case PAD_ACTION_NONE: snprintf( out, size, "Nothing" ); break;
+    case PAD_ACTION_MOUSE:
+        snprintf( out, size, "%s", wine_nx_mouse_labels[a->code < PAD_MOUSE_COUNT ? a->code : 0] );
+        break;
+    case PAD_ACTION_WHEEL: snprintf( out, size, "Wheel %s", a->code == PAD_WHEEL_DOWN ? "down" : "up" ); break;
+    case PAD_ACTION_KEY:
+        wine_nx_key_label( -1, a->code, key, sizeof(key) );
+        snprintf( out, size, "%s%s%s%s%s", a->mods & PAD_MOD_CTRL ? "Ctrl+" : "", a->mods & PAD_MOD_ALT ? "Alt+" : "",
+                  a->mods & PAD_MOD_SHIFT ? "Shift+" : "", a->mods & PAD_MOD_WIN ? "Win+" : "",
+                  a->code ? key : "" );
+        /* Modifiers alone: no trailing plus. */
+        if (!a->code && out[0] && out[strlen( out ) - 1] == '+') out[strlen( out ) - 1] = 0;
+        break;
+    default: wine_nx_key_label( control, 0, out, size ); break;
+    }
     return out;
 }
 

@@ -74,6 +74,34 @@ int main( void )
     /* A code from a hand-written file that the list does not name. */
     assert( !strcmp( wine_nx_key_label( 2, 0xf5, text, sizeof(text) ), "0xf5" ) );
 
+    /* Every named key is in a group the screen lists. */
+    for (i = 1; i < WINE_NX_KEY_NAME_COUNT; i++)
+        assert( wine_nx_key_category( wine_nx_key_names[i].code ) < WINE_NX_KEYS_CATEGORY_COUNT );
+    assert( wine_nx_key_category( 0x54 ) == WINE_NX_KEYS_LETTERS );
+    assert( wine_nx_key_category( 0xbc ) == WINE_NX_KEYS_PUNCTUATION );
+    assert( wine_nx_key_category( 0xe2 ) == WINE_NX_KEYS_PUNCTUATION );
+    assert( wine_nx_key_category( 0xa1 ) == WINE_NX_KEYS_MODIFIERS );
+    assert( wine_nx_key_category( 0x0d ) == WINE_NX_KEYS_EDITING );
+
+    /* What an action says on the screen. */
+    {
+        struct pad_action a;
+
+        assert( pad_action_parse( "shift+0x31", &a ) );
+        assert( !strcmp( wine_nx_action_label( 2, &a, text, sizeof(text) ), "Shift+1" ) );
+        assert( pad_action_parse( "ctrl+alt+0x2e", &a ) );
+        assert( !strcmp( wine_nx_action_label( 2, &a, text, sizeof(text) ), "Ctrl+Alt+Delete" ) );
+        assert( pad_action_parse( "mouse:right", &a ) );
+        assert( !strcmp( wine_nx_action_label( 2, &a, text, sizeof(text) ), "Right mouse button" ) );
+        assert( pad_action_parse( "wheel:down", &a ) );
+        assert( !strcmp( wine_nx_action_label( 2, &a, text, sizeof(text) ), "Wheel down" ) );
+        assert( pad_action_parse( "none", &a ) );
+        assert( !strcmp( wine_nx_action_label( 0, &a, text, sizeof(text) ), "Nothing" ) );
+        assert( pad_action_parse( "0", &a ) );
+        assert( !strcmp( wine_nx_action_label( 0, &a, text, sizeof(text) ), "Left mouse button" ) );
+        assert( wine_nx_control_index( "zr", 2 ) >= 0 && wine_nx_control_index( "ZRX", 3 ) < 0 );
+    }
+
     printf( "%d controls, %d keys named, none twice\n", WINE_NX_CONTROL_COUNT, WINE_NX_KEY_NAME_COUNT );
     return 0;
 }
@@ -83,5 +111,5 @@ with tempfile.TemporaryDirectory() as tmp:
     source = Path(tmp) / 'keys.c'
     source.write_text(fixture.replace('@HEADER@', header))
     binary = Path(tmp) / 'keys'
-    subprocess.run(['cc', '-o', str(binary), str(source)], check=True)
+    subprocess.run(['cc', '-I', str(root / 'horizon-wine/source'), '-o', str(binary), str(source)], check=True)
     print(subprocess.run([str(binary)], check=True, capture_output=True, text=True).stdout.strip())
