@@ -1,0 +1,56 @@
+# Build Autorun's SD card archive with build.sh, the way a developer's machine
+# does: Docker runs the switch-dev image, the host configures Wine's tree.
+name: Build
+
+on:
+  push:
+    branches: [controls]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  autorun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Make room
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /usr/local/.ghcup /usr/share/swift
+          sudo docker image prune -af >/dev/null
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: Host tools for Wine's configure
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bison flex gettext build-essential
+
+      # llvm-mingw and the Atmosphere boot payloads: build.sh fetches and
+      # builds them only when they are missing, and they rarely change.
+      - name: Toolchains cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            horizon-wine/toolchains
+          key: toolchains-${{ hashFiles('build.sh', 'horizon-wine/build-boot-bundle.sh', 'horizon-wine/switch-dev.txt') }}
+
+      - name: Build
+        run: sh build.sh --jobs "$(nproc)"
+
+      - name: Disk left
+        if: always()
+        run: df -h /
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autorun
+          path: horizon-wine/build-autorun/autorun-*.zip
+          if-no-files-found: error
