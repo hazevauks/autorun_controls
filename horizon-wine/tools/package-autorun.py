@@ -224,9 +224,19 @@ config.mkdir()
 ''')
 # The controller stands in for a keyboard; this lists what each control sends
 # and how to change it, with every line commented out so the defaults hold.
-(config / 'keys.txt').write_text('''# Keys the controller sends, one NAME=code line each, where code is a Windows
-# virtual-key code in decimal or 0x form. Remove the # to change one. A and B
-# are not here: they stay the left and right mouse buttons.
+(config / 'keys.txt').write_text('''# What the controller sends, one NAME=action line each. Remove the # to change
+# one; Settings -> Controls in Autorun writes these lines too. An action is
+# a Windows virtual-key code in decimal or 0x form, the same with keys held
+# with it (shift+0x31, ctrl+alt+0x2E), mouse:left, mouse:right, mouse:middle,
+# mouse:x1, mouse:x2, wheel:up, wheel:down, or none. A and B are the left and
+# right mouse buttons unless given something else.
+#
+# Combinations: MOD+NAME=action sends it while MOD is held and NAME pressed.
+#
+# L+A=0x54     hold L, press A: T
+# ZR+X=mouse:right
+# COMBOS=hold  the first control still sends its own while held; COMBOS=tap
+#              has it send its own only when tapped alone
 #
 # UP=0x26      d-pad up, and the left stick pushed up unless LUP is set
 # DOWN=0x28
