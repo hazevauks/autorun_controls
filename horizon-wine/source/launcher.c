@@ -3392,6 +3392,125 @@ static int read_combo_lines( const struct launcher_kv *kv, int own, struct combo
     return count;
 }
 
+/* The controls held now, a bit for each of wine_nx_controls, as SDL has them:
+ * by position, so Nintendo's A, on the right, is SDL's B. */
+static unsigned int held_controls( SDL_GameController *pad )
+{
+    static const struct { int button; const char *name; } buttons[] =
+    {
+        { SDL_CONTROLLER_BUTTON_B, "A" }, { SDL_CONTROLLER_BUTTON_A, "B" },
+        { SDL_CONTROLLER_BUTTON_Y, "X" }, { SDL_CONTROLLER_BUTTON_X, "Y" },
+        { SDL_CONTROLLER_BUTTON_LEFTSHOULDER, "L" }, { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, "R" },
+        { SDL_CONTROLLER_BUTTON_START, "PLUS" }, { SDL_CONTROLLER_BUTTON_BACK, "MINUS" },
+        { SDL_CONTROLLER_BUTTON_LEFTSTICK, "STICKL" }, { SDL_CONTROLLER_BUTTON_RIGHTSTICK, "STICKR" },
+        { SDL_CONTROLLER_BUTTON_DPAD_UP, "UP" }, { SDL_CONTROLLER_BUTTON_DPAD_DOWN, "DOWN" },
+        { SDL_CONTROLLER_BUTTON_DPAD_LEFT, "LEFT" }, { SDL_CONTROLLER_BUTTON_DPAD_RIGHT, "RIGHT" },
+    };
+    /* The triggers and the sticks' four ways, past most of their travel. */
+    static const struct { int axis, sign; const char *name; } axes[] =
+    {
+        { SDL_CONTROLLER_AXIS_TRIGGERLEFT, 1, "ZL" }, { SDL_CONTROLLER_AXIS_TRIGGERRIGHT, 1, "ZR" },
+        { SDL_CONTROLLER_AXIS_LEFTY, -1, "LUP" }, { SDL_CONTROLLER_AXIS_LEFTY, 1, "LDOWN" },
+        { SDL_CONTROLLER_AXIS_LEFTX, -1, "LLEFT" }, { SDL_CONTROLLER_AXIS_LEFTX, 1, "LRIGHT" },
+        { SDL_CONTROLLER_AXIS_RIGHTY, -1, "RUP" }, { SDL_CONTROLLER_AXIS_RIGHTY, 1, "RDOWN" },
+        { SDL_CONTROLLER_AXIS_RIGHTX, -1, "RLEFT" }, { SDL_CONTROLLER_AXIS_RIGHTX, 1, "RRIGHT" },
+    };
+    unsigned int held = 0, i;
+    int control;
+
+    for (i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++)
+        if (SDL_GameControllerGetButton( pad, buttons[i].button ) &&
+            (control = wine_nx_control_index( buttons[i].name, strlen( buttons[i].name ) )) >= 0)
+            held |= 1u << control;
+    for (i = 0; i < sizeof(axes) / sizeof(axes[0]); i++)
+        if (SDL_GameControllerGetAxis( pad, axes[i].axis ) * axes[i].sign > 20000 &&
+            (control = wine_nx_control_index( axes[i].name, strlen( axes[i].name ) )) >= 0)
+            held |= 1u << control;
+    return held;
+}
+
+/* A combination taken from the controller, the way it will be played: hold
+ * the first control, press the second, let go. Returns 1 with the two, 0 when
+ * the lists are wanted instead (a tap, or no controller to read), and -1 when
+ * nothing came of it. */
+static int capture_combo( struct launcher *l, int *mod, int *source )
+{
+    static const struct ui_hint hints[] = { { UI_NONE, "Tap the screen to choose from lists" } };
+    struct ui *ui = &l->ui;
+    struct ui_input input;
+    unsigned int previous = 0, peak = 0;
+    Uint32 started = SDL_GetTicks(), let_go = 0;
+    int armed = 0, count = 0, order[2] = { -1, -1 }, result = -1;
+
+    if (!ui->controller) return 0;
+    ui_start_screen( ui );
+    while (ui_begin_frame( ui ))
+    {
+        Uint32 now = SDL_GetTicks();
+        unsigned int held, pressed;
+        char line[128];
+        int i;
+
+        while (ui_poll( ui, &input ))
+            if (input.touch == UI_TOUCH_TAP) { result = 0; goto done; }
+        held = held_controls( ui->controller );
+        /* The A that opened this is not part of it. */
+        if (!armed)
+        {
+            armed = !held;
+            started = now;
+        }
+        else
+        {
+            pressed = held & ~previous;
+            for (i = 0; i < WINE_NX_CONTROL_COUNT; i++)
+                if ((pressed & (1u << i)) && !(peak & (1u << i)))
+                {
+                    if (count < 2) order[count] = i;
+                    count++;
+                }
+            peak |= held;
+            /* Done a moment after everything is let go. */
+            if (peak && !held)
+            {
+                if (!let_go) let_go = now;
+                else if (now - let_go > 150) { result = 1; goto done; }
+            }
+            else let_go = 0;
+            if (!peak && now - started > 10000) goto done;
+        }
+        previous = held;
+
+        ui_background( ui );
+        ui_header_back( ui, "Add a combination", "Controls" );
+        ui_text_centered( ui, ui->normal, ui->width / 2, 250,
+                          "Hold the first control, press the second, then let go of both.", ui->text );
+        if (count == 1) snprintf( line, sizeof(line), "%s + ...", wine_nx_controls[order[0]].label );
+        else if (count == 2)
+            snprintf( line, sizeof(line), "%s + %s", wine_nx_controls[order[0]].label,
+                      wine_nx_controls[order[1]].label );
+        else if (count > 2) snprintf( line, sizeof(line), "Only two controls" );
+        else line[0] = 0;
+        if (line[0]) ui_text_centered( ui, ui->large, ui->width / 2, 330, line, ui->value );
+        ui_footer( ui, hints, 1 );
+        ui_present( ui );
+        ui_wait( ui );
+    }
+done:
+    ui_start_screen( ui );
+    if (result != 1) return result;
+    if (count != 2)
+    {
+        ui_message( ui, "Combinations", count > 2 ? "A combination is two controls: try again with two."
+                                                  : "A combination is two controls, one held, then the other." );
+        ui_start_screen( ui );
+        return -1;
+    }
+    *mod = order[0];
+    *source = order[1];
+    return 1;
+}
+
 /* The controls the runtime keeps for itself, held together: Minus with the
  * right stick pressed opens the floating keyboard, and Plus with Minus closes
  * the program. */
@@ -3486,13 +3605,21 @@ static int combos_screen( struct launcher *l, struct launcher_kv *keys, const st
                 ui_start_screen( &l->ui );
                 continue;
             }
-            mod = pick_screen( l, "Hold", labels, NULL, WINE_NX_CONTROL_COUNT, 0 );
-            ui_start_screen( &l->ui );
-            if (mod < 0) continue;
-            snprintf( label, sizeof(label), "Hold %s, then press", wine_nx_controls[mod].label );
-            source = pick_screen( l, label, labels, NULL, WINE_NX_CONTROL_COUNT, 0 );
-            ui_start_screen( &l->ui );
-            if (source < 0) continue;
+            /* Pressed on the controller, or chosen from lists. */
+            switch (capture_combo( l, &mod, &source ))
+            {
+            case 1: break;
+            case 0:
+                mod = pick_screen( l, "Hold", labels, NULL, WINE_NX_CONTROL_COUNT, 0 );
+                ui_start_screen( &l->ui );
+                if (mod < 0) continue;
+                snprintf( label, sizeof(label), "Hold %s, then press", wine_nx_controls[mod].label );
+                source = pick_screen( l, label, labels, NULL, WINE_NX_CONTROL_COUNT, 0 );
+                ui_start_screen( &l->ui );
+                if (source < 0) continue;
+                break;
+            default: continue;
+            }
             if (source == mod || combo_reserved( mod, source ))
             {
                 ui_message( &l->ui, "Combinations", source == mod ? "A combination is two different controls."
